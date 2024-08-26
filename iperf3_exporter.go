@@ -25,6 +25,7 @@ import (
 
 	_ "net/http/pprof"
 
+	"github.com/BGrewell/go-iperf"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/prometheus/common/log"
@@ -64,10 +65,13 @@ type iperfResult struct {
 // the prometheus metrics package.
 type Exporter struct {
 	target  string
-        port	int
+	port    int
 	period  time.Duration
 	timeout time.Duration
 	mutex   sync.RWMutex
+	reverse bool
+
+	report iperf.TestReport
 
 	success         *prometheus.Desc
 	sentSeconds     *prometheus.Desc
@@ -77,17 +81,23 @@ type Exporter struct {
 }
 
 // NewExporter returns an initialized Exporter.
-func NewExporter(target string, port int, period time.Duration, timeout time.Duration) *Exporter {
+func NewExporter(target string, port int, period time.Duration, timeout time.Duration, reverse bool) *Exporter {
+	direction := "download"
+	if reverse {
+		direction = "upload"
+	}
+	labels := prometheus.Labels{"target": target, "port": strconv.Itoa(port), "direction": direction}
 	return &Exporter{
 		target:          target,
-                port:            port,
+		port:            port,
 		period:          period,
+		reverse:         reverse,
 		timeout:         timeout,
-		success:         prometheus.NewDesc(prometheus.BuildFQName(namespace, "", "success"), "Was the last iperf3 probe successful.", nil, nil),
-		sentSeconds:     prometheus.NewDesc(prometheus.BuildFQName(namespace, "", "sent_seconds"), "Total seconds spent sending packets.", nil, nil),
-		sentBytes:       prometheus.NewDesc(prometheus.BuildFQName(namespace, "", "sent_bytes"), "Total sent bytes.", nil, nil),
-		receivedSeconds: prometheus.NewDesc(prometheus.BuildFQName(namespace, "", "received_seconds"), "Total seconds spent receiving packets.", nil, nil),
-		receivedBytes:   prometheus.NewDesc(prometheus.BuildFQName(namespace, "", "received_bytes"), "Total received bytes.", nil, nil),
+		success:         prometheus.NewDesc(prometheus.BuildFQName(namespace, "", "success"), "Was the last iperf3 probe successful.", nil, labels),
+		sentSeconds:     prometheus.NewDesc(prometheus.BuildFQName(namespace, "", "sent_seconds"), "Total seconds spent sending packets.", nil, labels),
+		sentBytes:       prometheus.NewDesc(prometheus.BuildFQName(namespace, "", "sent_bytes"), "Total sent bytes.", nil, labels),
+		receivedSeconds: prometheus.NewDesc(prometheus.BuildFQName(namespace, "", "received_seconds"), "Total seconds spent receiving packets.", nil, labels),
+		receivedBytes:   prometheus.NewDesc(prometheus.BuildFQName(namespace, "", "received_bytes"), "Total received bytes.", nil, labels),
 	}
 }
 
@@ -101,6 +111,33 @@ func (e *Exporter) Describe(ch chan<- *prometheus.Desc) {
 	ch <- e.receivedBytes
 }
 
+func (e *Exporter) measure() {
+	c := iperf.NewClient(e.target)
+	c.SetJSON(true)
+	c.SetPort(e.port)
+	c.SetStreams(4)
+	c.SetTimeSec(30)
+	c.SetInterval(1)
+	c.SetReverse(e.reverse)
+	c.Debug = true
+
+	err := c.Start()
+	if err != nil {
+		fmt.Printf("Failed to run iperf3: %s", err)
+		return
+	}
+
+	<-c.Done
+
+	report := c.Report()
+	if report == nil {
+		log.Error("iperf3 report is nil")
+		return
+	}
+
+	log.Info(report.String())
+}
+
 // Collect probes the configured iperf3 server and delivers them as Prometheus
 // metrics. It implements prometheus.Collector.
 func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
@@ -110,7 +147,14 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 	ctx, cancel := context.WithTimeout(context.Background(), e.timeout)
 	defer cancel()
 
-	out, err := exec.CommandContext(ctx, iperfCmd, "-J", "-t", strconv.FormatFloat(e.period.Seconds(), 'f', 0, 64), "-c", e.target, "-p", strconv.Itoa(e.port)).Output()
+	var iperfArgs []string
+
+	iperfArgs = []string{"-J", "-t", strconv.FormatFloat(e.period.Seconds(), 'f', 0, 64), "-c", e.target, "-p", strconv.Itoa(e.port)}
+	if e.reverse {
+		iperfArgs = append(iperfArgs, "-R")
+	}
+
+	out, err := exec.CommandContext(ctx, iperfCmd, iperfArgs...).Output()
 	if err != nil {
 		ch <- prometheus.MustNewConstMetric(e.success, prometheus.GaugeValue, 0)
 		iperfErrors.Inc()
@@ -119,7 +163,7 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 	}
 
 	stats := iperfResult{}
-	if err := json.Unmarshal(out, &stats); err != nil {
+	if err := json.Unmarshal([]byte(out), &stats); err != nil {
 		ch <- prometheus.MustNewConstMetric(e.success, prometheus.GaugeValue, 0)
 		iperfErrors.Inc()
 		log.Errorf("Failed to parse iperf3 result: %s", err)
@@ -140,22 +184,36 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		iperfErrors.Inc()
 		return
 	}
-        
-        var targetPort int
-        port := r.URL.Query().Get("port")
-        if port != "" {
-                var err error 
-                targetPort, err = strconv.Atoi(port)
-                if err != nil {
-                        http.Error(w, fmt.Sprintf("'port' parameter must be an integer: %s", err), http.StatusBadRequest)
-                        iperfErrors.Inc()
-                        return
-                }
-        } 
-        if targetPort == 0 {
-                targetPort = 5201
-        }
-        
+
+	var targetPort int
+	port := r.URL.Query().Get("port")
+	if port != "" {
+		var err error
+		targetPort, err = strconv.Atoi(port)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("'port' parameter must be an integer: %s", err), http.StatusBadRequest)
+			iperfErrors.Inc()
+			return
+		}
+	}
+	if targetPort == 0 {
+		targetPort = 5201
+	}
+
+	var reverseMode bool
+	reverse_mode := r.URL.Query().Get("reverse")
+	if reverse_mode != "" {
+		var err error
+		reverseMode, err = strconv.ParseBool(reverse_mode)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("'reverse' parameter must be a boolean: %s", err), http.StatusBadRequest)
+			iperfErrors.Inc()
+			return
+		}
+	} else {
+		reverseMode = false
+	}
+
 	var runPeriod time.Duration
 	period := r.URL.Query().Get("period")
 	if period != "" {
@@ -198,7 +256,7 @@ func handler(w http.ResponseWriter, r *http.Request) {
 
 	start := time.Now()
 	registry := prometheus.NewRegistry()
-	exporter := NewExporter(target, targetPort, runPeriod, runTimeout)
+	exporter := NewExporter(target, targetPort, runPeriod, runTimeout, reverseMode)
 	registry.MustRegister(exporter)
 
 	// Delegate http serving to Prometheus client library, which will call collector.Collect.
