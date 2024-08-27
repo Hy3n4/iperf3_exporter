@@ -82,9 +82,9 @@ type Exporter struct {
 
 // NewExporter returns an initialized Exporter.
 func NewExporter(target string, port int, period time.Duration, timeout time.Duration, reverse bool) *Exporter {
-	direction := "download"
+	direction := "upload"
 	if reverse {
-		direction = "upload"
+		direction = "download"
 	}
 	labels := prometheus.Labels{"target": target, "port": strconv.Itoa(port), "direction": direction}
 	return &Exporter{
